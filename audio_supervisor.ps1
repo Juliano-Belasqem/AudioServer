@@ -1,62 +1,18 @@
 $ErrorActionPreference = 'Stop'
-
-$ProjectDir = 'C:\AudioServer'
-$Branch = 'main'
-$CheckIntervalSeconds = 60
-
+$ProjectDir='C:\AudioServer'; $Branch='main'; $CheckIntervalSeconds=60
 Set-Location $ProjectDir
-
+function Test-Code { param([string]$Dir) & python -m py_compile (Join-Path $Dir 'audio_server.py'); return ($LASTEXITCODE -eq 0) }
+function Start-AudioServer { Write-Host 'Iniciando AudioServer...'; return Start-Process -FilePath 'python' -ArgumentList 'audio_server.py' -WorkingDirectory $ProjectDir -PassThru }
 function Update-Repository {
-    git fetch origin $Branch | Out-Host
-
-    $local = (git rev-parse HEAD).Trim()
-    $remote = (git rev-parse "origin/$Branch").Trim()
-
-    if ($local -ne $remote) {
-        Write-Host "Atualização encontrada. Baixando nova versão..."
-        git pull --ff-only origin $Branch | Out-Host
-        return $true
-    }
-
-    return $false
+ git fetch origin $Branch | Out-Host; $local=(git rev-parse HEAD).Trim(); $remote=(git rev-parse "origin/$Branch").Trim(); if($local -eq $remote){return $false}
+ $previous=$local; Write-Host "Atualizacao encontrada: $remote"; git pull --ff-only origin $Branch | Out-Host
+ if(-not (Test-Code $ProjectDir)){ Write-Warning 'Nova versao falhou na validacao. Fazendo rollback.'; git reset --hard $previous | Out-Host; return $false }
+ return $true
 }
-
-function Start-AudioServer {
-    Write-Host "Iniciando AudioServer..."
-    return Start-Process -FilePath 'python' -ArgumentList 'audio_server.py' -WorkingDirectory $ProjectDir -PassThru
-}
-
-try {
-    Update-Repository | Out-Null
-} catch {
-    Write-Warning "Não foi possível verificar atualizações na inicialização: $($_.Exception.Message)"
-}
-
-$serverProcess = Start-AudioServer
-
-while ($true) {
-    Start-Sleep -Seconds $CheckIntervalSeconds
-
-    try {
-        $updated = Update-Repository
-
-        if ($updated) {
-            if ($serverProcess -and -not $serverProcess.HasExited) {
-                Write-Host "Parando servidor antigo..."
-                Stop-Process -Id $serverProcess.Id -Force
-                $serverProcess.WaitForExit()
-            }
-
-            $serverProcess = Start-AudioServer
-            Write-Host "AudioServer reiniciado com a nova versão."
-            continue
-        }
-    } catch {
-        Write-Warning "Falha ao verificar atualização: $($_.Exception.Message)"
-    }
-
-    if (-not $serverProcess -or $serverProcess.HasExited) {
-        Write-Warning "AudioServer não está em execução. Reiniciando..."
-        $serverProcess = Start-AudioServer
-    }
+try{Update-Repository|Out-Null}catch{Write-Warning "Falha na atualizacao inicial: $($_.Exception.Message)"}
+$serverProcess=Start-AudioServer
+while($true){
+ Start-Sleep -Seconds $CheckIntervalSeconds
+ try{$updated=Update-Repository;if($updated){if($serverProcess -and -not $serverProcess.HasExited){Stop-Process -Id $serverProcess.Id -Force;$serverProcess.WaitForExit()};$serverProcess=Start-AudioServer;Start-Sleep 4;if($serverProcess.HasExited){Write-Warning 'Nova versao encerrou apos iniciar. Verifique logs.'};continue}}catch{Write-Warning "Falha ao verificar atualizacao: $($_.Exception.Message)"}
+ if(-not $serverProcess -or $serverProcess.HasExited){Write-Warning 'AudioServer nao esta em execucao. Reiniciando...';$serverProcess=Start-AudioServer}
 }
