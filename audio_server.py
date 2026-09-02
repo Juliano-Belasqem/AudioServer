@@ -6,12 +6,14 @@ from logging.handlers import RotatingFileHandler
 import pygame
 from pycaw.pycaw import AudioUtilities
 import comtypes
+from diagnostics import bp as diagnostics_bp
+from network_service import start_mdns
 
 PROJECT_DIR=os.path.dirname(os.path.abspath(__file__))
 SOUNDS_DIR=r'C:\Sounds'; SUPPORTED_EXTENSIONS={'.mp3','.wav','.ogg','.flac'}
 SETTINGS_FILE=os.path.join(PROJECT_DIR,'local_settings.json'); BACKUP_DIR=os.path.join(PROJECT_DIR,'backups')
 LOG_DIR=os.path.join(PROJECT_DIR,'logs'); LOG_FILE=os.path.join(LOG_DIR,'audio_server.log')
-app=Flask(__name__); pygame.mixer.init(); START_TIME=time.time(); lock=threading.Lock(); history=deque(maxlen=250); request_times=defaultdict(deque); current_sound=None
+app=Flask(__name__); app.register_blueprint(diagnostics_bp); pygame.mixer.init(); START_TIME=time.time(); lock=threading.Lock(); history=deque(maxlen=250); request_times=defaultdict(deque); current_sound=None
 duck_lock=threading.Lock(); duck_generation=0; spotify_original_volumes={}; duck_active=False
 
 def setup_logging():
@@ -135,7 +137,7 @@ def dashboard():return render_template('index.html')
 @app.get('/status')
 def status():
  busy=bool(pygame.mixer.music.get_busy());sounds=scan_sounds();cfg=SETTINGS['ducking'];sp=spotify_state()
- return jsonify({'status':'online','server_time':datetime.now().isoformat(timespec='seconds'),'version':version(),'uptime_seconds':int(time.time()-START_TIME),'playing':busy,'current_sound':current_sound if busy else None,'volume':round(pygame.mixer.music.get_volume(),2),'sounds_count':len(sounds),'maintenance':bool(SETTINGS.get('maintenance')),'next_schedule':next_schedule(),'spotify':sp,'ducking':{'enabled':cfg['enabled'],'active':duck_active,'spotify_volume_during_alert':cfg['duck_volume'],'fade_down_ms':cfg['fade_down_ms'],'fade_up_ms':cfg['fade_up_ms'],'restore_delay_ms':cfg['restore_delay_ms']}})
+ return jsonify({'status':'online','server_time':datetime.now().isoformat(timespec='seconds'),'friendly_url':'http://audioserver.local:8765/','version':version(),'uptime_seconds':int(time.time()-START_TIME),'playing':busy,'current_sound':current_sound if busy else None,'volume':round(pygame.mixer.music.get_volume(),2),'sounds_count':len(sounds),'maintenance':bool(SETTINGS.get('maintenance')),'next_schedule':next_schedule(),'spotify':sp,'ducking':{'enabled':cfg['enabled'],'active':duck_active,'spotify_volume_during_alert':cfg['duck_volume'],'fade_down_ms':cfg['fade_down_ms'],'fade_up_ms':cfg['fade_up_ms'],'restore_delay_ms':cfg['restore_delay_ms']}})
 @app.get('/sounds')
 def sounds():
  data=scan_sounds();return jsonify({'directory':SOUNDS_DIR,'sounds':[{'name':n,**meta,'profile':sound_profile(n)} for n,meta in data.items()]})
@@ -205,4 +207,6 @@ def scheduler():
    except Exception as exc:app.logger.error('scheduler error=%s',exc)
   fired={x for x in fired if x.startswith(now.strftime('%Y-%m-%d'))};time.sleep(10)
 threading.Thread(target=scheduler,daemon=True).start()
-if __name__=='__main__':app.run(host='0.0.0.0',port=8765,threaded=True)
+if __name__=='__main__':
+ start_mdns(8765)
+ app.run(host='0.0.0.0',port=8765,threaded=True)
