@@ -1,2 +1,5 @@
 flask
 pygame
+pycaw
+comtypes
+psutil
