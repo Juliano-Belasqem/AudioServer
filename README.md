@@ -1,6 +1,16 @@
 # AudioServer
 
-Servidor HTTP simples para Windows que permite a outros computadores da mesma rede solicitar a reprodução de arquivos de áudio locais via requisição `POST`.
+Servidor HTTP simples para Windows que permite a outros computadores da mesma rede controlar a reprodução de arquivos de áudio locais via HTTP.
+
+## Recursos
+
+- Reprodução de sons por nome
+- Autenticação por token nos comandos de controle
+- Comandos `play`, `stop`, `pause`, `resume` e `volume`
+- Lista de sons em `sounds.json`
+- Endpoint público de diagnóstico `/status`
+- Logs rotativos em `C:\AudioServer\logs`
+- Atualização automática pelo `audio_supervisor.ps1`
 
 ## Requisitos
 
@@ -10,52 +20,118 @@ Servidor HTTP simples para Windows que permite a outros computadores da mesma re
 
 Instale as dependências com:
 
-```cmd
+```powershell
 pip install -r requirements.txt
 ```
 
-## Estrutura esperada no Windows
+## Arquivos principais
 
 ```text
 C:\AudioServer\audio_server.py
+C:\AudioServer\audio_supervisor.ps1
+C:\AudioServer\sounds.json
+C:\AudioServer\audio_server_token.txt
+C:\AudioServer\logs\audio_server.log
 C:\Sounds\Juliano-Caixa.mp3
 ```
 
-Os arquivos de áudio não são enviados ao GitHub por padrão.
+`audio_server_token.txt` é criado automaticamente na primeira execução e não é enviado ao GitHub.
 
-## Executar o servidor
+## Sons
 
-No Prompt de Comando:
-
-```cmd
-cd C:\AudioServer
-python audio_server.py
-```
-
-O servidor escuta na porta `8765` em todas as interfaces de rede (`0.0.0.0`). Na máquina atual, o endereço observado foi `192.168.1.120:8765`.
-
-## Teste local
-
-```cmd
-curl -X POST http://127.0.0.1:8765/play -H "Content-Type: application/json" -d "{\"sound\":\"Juliano-Caixa\"}"
-```
-
-## Teste a partir de outro computador da rede
-
-```cmd
-curl -X POST http://192.168.1.120:8765/play -H "Content-Type: application/json" -d "{\"sound\":\"Juliano-Caixa\"}"
-```
-
-Resposta esperada:
+A lista fica em `sounds.json`:
 
 ```json
-{"sound":"Juliano-Caixa","status":"playing"}
+{
+  "Juliano-Caixa": "C:\\Sounds\\Juliano-Caixa.mp3"
+}
 ```
 
-## Observação sobre IP
+Ao alterar `sounds.json` no GitHub, o supervisor baixa a nova versão e reinicia o servidor automaticamente.
 
-O endereço `192.168.1.120` pode mudar se o roteador entregar outro IP ao computador. Para uso permanente, é recomendável configurar uma reserva DHCP no roteador.
+## Token de acesso
+
+Os comandos que alteram o áudio exigem o cabeçalho:
+
+```text
+Authorization: Bearer SEU_TOKEN
+```
+
+Na máquina do AudioServer, consulte o token com:
+
+```powershell
+Get-Content C:\AudioServer\audio_server_token.txt
+```
+
+Não compartilhe esse arquivo nem envie o token para o GitHub.
+
+## Status
+
+O status não exige token:
+
+```powershell
+Invoke-RestMethod -Uri "http://192.168.1.120:8765/status" -Method Get
+```
+
+## Exemplos no PowerShell
+
+Primeiro carregue o token:
+
+```powershell
+$token = Get-Content C:\AudioServer\audio_server_token.txt
+$headers = @{ Authorization = "Bearer $token" }
+```
+
+Reproduzir:
+
+```powershell
+Invoke-RestMethod -Uri "http://192.168.1.120:8765/play" -Method Post -Headers $headers -ContentType "application/json" -Body '{"sound":"Juliano-Caixa"}'
+```
+
+Parar:
+
+```powershell
+Invoke-RestMethod -Uri "http://192.168.1.120:8765/stop" -Method Post -Headers $headers
+```
+
+Pausar:
+
+```powershell
+Invoke-RestMethod -Uri "http://192.168.1.120:8765/pause" -Method Post -Headers $headers
+```
+
+Retomar:
+
+```powershell
+Invoke-RestMethod -Uri "http://192.168.1.120:8765/resume" -Method Post -Headers $headers
+```
+
+Volume, de `0.0` a `1.0`:
+
+```powershell
+Invoke-RestMethod -Uri "http://192.168.1.120:8765/volume" -Method Post -Headers $headers -ContentType "application/json" -Body '{"volume":0.5}'
+```
+
+## Logs
+
+O arquivo principal é:
+
+```text
+C:\AudioServer\logs\audio_server.log
+```
+
+Ele registra horário, IP de origem, ação executada, resultado e detalhes relevantes. Os logs usam rotação automática para evitar crescimento ilimitado.
+
+Para acompanhar em tempo real:
+
+```powershell
+Get-Content C:\AudioServer\logs\audio_server.log -Wait
+```
 
 ## Segurança
 
-Este projeto foi pensado inicialmente para uso em uma rede local confiável. Não exponha a porta `8765` diretamente à internet. Uma próxima melhoria recomendada é adicionar autenticação por token.
+A porta `8765` deve permanecer restrita à rede local. Não exponha o servidor diretamente à internet. O token protege os comandos de controle, mas não substitui firewall e segmentação adequada da rede.
+
+## IP
+
+Na instalação atual o servidor é acessado por `192.168.1.120:8765`. Esse endereço pode mudar se não houver uma reserva DHCP no roteador.
