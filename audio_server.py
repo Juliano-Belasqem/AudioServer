@@ -23,18 +23,19 @@ def load_json(path,default):
 def backup_settings():
  if not os.path.exists(SETTINGS_FILE):return
  os.makedirs(BACKUP_DIR,exist_ok=True); name='local_settings_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'.json'; shutil.copy2(SETTINGS_FILE,os.path.join(BACKUP_DIR,name))
- files=sorted([x for x in os.listdir(BACKUP_DIR) if x.endswith('.json')]);
+ files=sorted([x for x in os.listdir(BACKUP_DIR) if x.endswith('.json')])
  for old in files[:-20]:
   try:os.remove(os.path.join(BACKUP_DIR,old))
   except OSError:pass
-def save_settings():backup_settings();
+def save_settings():
+ backup_settings()
  with open(SETTINGS_FILE,'w',encoding='utf-8') as f:json.dump(SETTINGS,f,ensure_ascii=False,indent=2)
 def version():
  try:return subprocess.run(['git','rev-parse','--short','HEAD'],cwd=PROJECT_DIR,capture_output=True,text=True,timeout=3,check=True).stdout.strip()
  except Exception:return 'unknown'
 def ip():return request.remote_addr or 'unknown'
 def add_history(action,result,details='',scheduled_for=None):
- item={'time':datetime.now().isoformat(timespec='seconds'),'ip':ip() if request else 'scheduler','action':action,'result':result,'details':details}
+ item={'time':datetime.now().isoformat(timespec='seconds'),'ip':request.remote_addr if request else 'scheduler','action':action,'result':result,'details':details}
  if scheduled_for:item['scheduled_for']=scheduled_for
  history.appendleft(item); app.logger.info('action=%s | result=%s | %s',action,result,details)
 def scan_sounds():
@@ -92,8 +93,8 @@ def restore_spotify_volume(expected_generation=None):
     if pid in current:fade_volume(current[pid],float(current[pid].GetMasterVolume()),float(orig),int(cfg.get('fade_up_ms',2000)))
    spotify_original_volumes.clear(); duck_active=False
  finally:comtypes.CoUninitialize()
-def wait_and_restore(gen,fade_out_ms):
- while pygame.mixer.music.get_busy():time.sleep(0.1)
+def wait_and_restore(gen):
+ while pygame.mixer.music.get_busy():time.sleep(.1)
  restore_spotify_volume(gen)
 def play_sound(name,source='manual'):
  global current_sound,duck_generation
@@ -102,7 +103,7 @@ def play_sound(name,source='manual'):
  profile=sound_profile(name); path=sounds[name]['path']
  with lock:
   apply_spotify_duck(profile); duck_generation+=1; gen=duck_generation; pygame.mixer.music.set_volume(profile['volume']); pygame.mixer.music.load(path); pygame.mixer.music.play(fade_ms=profile['alert_fade_in_ms']); current_sound=name
- threading.Thread(target=wait_and_restore,args=(gen,profile['alert_fade_out_ms']),daemon=True).start(); return True,None
+ threading.Thread(target=wait_and_restore,args=(gen,),daemon=True).start();return True,None
 def next_schedule():
  now=datetime.now(); candidates=[]
  for s in SETTINGS.get('schedules',[]):
@@ -110,23 +111,22 @@ def next_schedule():
   try:h,m=map(int,s['time'].split(':'))
   except Exception:continue
   days=s.get('weekdays',[])
-  for offset in range(0,8):
-   d=now+timedelta(days=offset)
+  for off in range(8):
+   d=now+timedelta(days=off)
    if days and d.weekday() not in days:continue
    dt=d.replace(hour=h,minute=m,second=0,microsecond=0)
    if dt>now:candidates.append((dt,s));break
  if not candidates:return None
  dt,s=min(candidates,key=lambda x:x[0]);return {'sound':s.get('sound'),'datetime':dt.isoformat(timespec='minutes'),'time':s.get('time'),'weekdays':s.get('weekdays',[])}
 
-setup_logging(); SETTINGS=load_json(SETTINGS_FILE,{'volume':1.0,'maintenance':False,'allowed_ips':[],'schedules':[],'ducking':{'enabled':True,'duck_volume':0.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000},'sound_profiles':{}}); SETTINGS.setdefault('sound_profiles',{}); SETTINGS.setdefault('schedules',[]); SETTINGS.setdefault('ducking',{})
-for k,v in {'enabled':True,'duck_volume':0.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000}.items():SETTINGS['ducking'].setdefault(k,v)
+setup_logging(); SETTINGS=load_json(SETTINGS_FILE,{'volume':1.0,'maintenance':False,'allowed_ips':[],'schedules':[],'ducking':{'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000},'sound_profiles':{}});SETTINGS.setdefault('sound_profiles',{});SETTINGS.setdefault('schedules',[]);SETTINGS.setdefault('ducking',{})
+for k,v in {'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000}.items():SETTINGS['ducking'].setdefault(k,v)
 pygame.mixer.music.set_volume(float(SETTINGS.get('volume',1.0)))
-
 @app.before_request
 def protection():
  allowed=SETTINGS.get('allowed_ips',[])
  if allowed and ip() not in allowed and ip() not in ('127.0.0.1','::1'):return jsonify({'error':'IP nao autorizado'}),403
- q=request_times[ip()]; now=time.time()
+ q=request_times[ip()];now=time.time()
  while q and now-q[0]>60:q.popleft()
  if len(q)>=120:return jsonify({'error':'Muitas requisicoes'}),429
  q.append(now)
@@ -134,21 +134,22 @@ def protection():
 def dashboard():return render_template('index.html')
 @app.get('/status')
 def status():
- busy=bool(pygame.mixer.music.get_busy()); sounds=scan_sounds(); cfg=SETTINGS['ducking']; sp=spotify_state()
- return jsonify({'status':'online','server_time':datetime.now().isoformat(timespec='seconds'),'version':version(),'uptime_seconds':int(time.time()-START_TIME),'playing':busy,'current_sound':current_sound if busy else None,'volume':round(pygame.mixer.music.get_volume(),2),'sounds_count':len(sounds),'requests_last_minute':sum(len(x) for x in request_times.values()),'maintenance':bool(SETTINGS.get('maintenance')),'next_schedule':next_schedule(),'spotify':sp,'ducking':{'enabled':cfg['enabled'],'active':duck_active,'spotify_volume_during_alert':cfg['duck_volume'],'fade_down_ms':cfg['fade_down_ms'],'fade_up_ms':cfg['fade_up_ms'],'restore_delay_ms':cfg['restore_delay_ms']}})
+ busy=bool(pygame.mixer.music.get_busy());sounds=scan_sounds();cfg=SETTINGS['ducking'];sp=spotify_state()
+ return jsonify({'status':'online','server_time':datetime.now().isoformat(timespec='seconds'),'version':version(),'uptime_seconds':int(time.time()-START_TIME),'playing':busy,'current_sound':current_sound if busy else None,'volume':round(pygame.mixer.music.get_volume(),2),'sounds_count':len(sounds),'maintenance':bool(SETTINGS.get('maintenance')),'next_schedule':next_schedule(),'spotify':sp,'ducking':{'enabled':cfg['enabled'],'active':duck_active,'spotify_volume_during_alert':cfg['duck_volume'],'fade_down_ms':cfg['fade_down_ms'],'fade_up_ms':cfg['fade_up_ms'],'restore_delay_ms':cfg['restore_delay_ms']}})
 @app.get('/sounds')
 def sounds():
- data=scan_sounds(); return jsonify({'directory':SOUNDS_DIR,'sounds':[{'name':n,**meta,'profile':sound_profile(n)} for n,meta in data.items()]})
+ data=scan_sounds();return jsonify({'directory':SOUNDS_DIR,'sounds':[{'name':n,**meta,'profile':sound_profile(n)} for n,meta in data.items()]})
 @app.get('/history')
 def get_history():return jsonify({'history':list(history)})
 @app.post('/play')
 def play():
  if SETTINGS.get('maintenance'):return jsonify({'error':'Servidor em modo de manutencao'}),503
- name=(request.get_json(silent=True) or {}).get('sound'); ok,err=play_sound(name)
+ name=(request.get_json(silent=True) or {}).get('sound');ok,err=play_sound(name)
  if not ok:add_history('play','error',f'sound={name} error={err}');return jsonify({'error':err}),404
  add_history('play','ok',f'sound={name}');return jsonify({'status':'playing','sound':name})
 @app.post('/stop')
-def stop():pygame.mixer.music.fadeout(sound_profile(current_sound).get('alert_fade_out_ms',400) if current_sound else 400);restore_spotify_volume();add_history('stop','ok');return jsonify({'status':'stopped'})
+def stop():
+ fade=sound_profile(current_sound)['alert_fade_out_ms'] if current_sound else 400;pygame.mixer.music.fadeout(fade);restore_spotify_volume();add_history('stop','ok');return jsonify({'status':'stopped'})
 @app.post('/pause')
 def pause():pygame.mixer.music.pause();add_history('pause','ok');return jsonify({'status':'paused'})
 @app.post('/resume')
@@ -161,11 +162,10 @@ def volume():
 @app.post('/ducking')
 def ducking():
  data=request.get_json(silent=True) or {};cfg=SETTINGS['ducking']
- for f in ('duck_volume',):
-  if f in data:cfg[f]=max(0,min(1,float(data[f])))
+ if 'enabled' in data:cfg['enabled']=bool(data['enabled'])
+ if 'duck_volume' in data:cfg['duck_volume']=max(0,min(1,float(data['duck_volume'])))
  for f in ('fade_down_ms','fade_up_ms','restore_delay_ms'):
   if f in data:cfg[f]=max(0,min(10000,int(data[f])))
- if 'enabled' in data:cfg['enabled']=bool(data['enabled'])
  save_settings();return jsonify({'ducking':cfg})
 @app.post('/maintenance')
 def maintenance():SETTINGS['maintenance']=bool((request.get_json(silent=True) or {}).get('enabled'));save_settings();return jsonify({'maintenance':SETTINGS['maintenance']})
@@ -173,7 +173,7 @@ def maintenance():SETTINGS['maintenance']=bool((request.get_json(silent=True) or
 def config():return jsonify({'allowed_ips':SETTINGS.get('allowed_ips',[]),'schedules':SETTINGS.get('schedules',[]),'sound_profiles':SETTINGS.get('sound_profiles',{}),'ducking':SETTINGS['ducking']})
 @app.post('/config/schedules')
 def schedules():
- s=(request.get_json(silent=True) or {}).get('schedules');
+ s=(request.get_json(silent=True) or {}).get('schedules')
  if not isinstance(s,list):return jsonify({'error':'schedules deve ser uma lista'}),400
  SETTINGS['schedules']=s;save_settings();add_history('schedules','ok',f'count={len(s)}');return jsonify({'schedules':s})
 @app.post('/config/sound-profile')
@@ -188,7 +188,6 @@ def sound_profile_api():
  for f in ('duck_enabled','favorite'):
   if f in data:p[f]=bool(data[f])
  save_settings();return jsonify({'sound':name,'profile':sound_profile(name)})
-
 def scheduler():
  fired=set()
  while True:
