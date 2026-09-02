@@ -1,16 +1,36 @@
 from flask import Flask, request, jsonify
 import pygame
 import os
+import subprocess
 
 app = Flask(__name__)
 
-# Inicializa o sistema de áudio
 pygame.mixer.init()
 
-# Lista dos áudios disponíveis
 SOUNDS = {
     "Juliano-Caixa": r"C:\Sounds\Juliano-Caixa.mp3",
 }
+
+
+def get_git_version():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=r"C:\AudioServer",
+            text=True
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+@app.get("/status")
+def status():
+    return jsonify({
+        "status": "online",
+        "version": get_git_version(),
+        "sounds": sorted(SOUNDS.keys())
+    })
+
 
 @app.post("/play")
 def play():
@@ -33,5 +53,5 @@ def play():
         "sound": sound_name
     })
 
-# Aceita conexões de outros computadores da rede
+
 app.run(host="0.0.0.0", port=8765)
