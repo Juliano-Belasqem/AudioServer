@@ -5,3 +5,4 @@ comtypes
 psutil
 zeroconf
 pywin32
+num2words
