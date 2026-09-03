@@ -4,3 +4,4 @@ pycaw
 comtypes
 psutil
 zeroconf
+pywin32
