@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, render_template, Response
-import json, logging, os, shutil, subprocess, threading, time, heapq
+import json, logging, os, shutil, subprocess, threading, time, heapq, sys
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -13,10 +13,12 @@ PROJECT_DIR=os.path.dirname(os.path.abspath(__file__))
 SOUNDS_DIR=r'C:\Sounds'; SUPPORTED_EXTENSIONS={'.mp3','.wav','.ogg','.flac'}
 SETTINGS_FILE=os.path.join(PROJECT_DIR,'local_settings.json'); BACKUP_DIR=os.path.join(PROJECT_DIR,'backups')
 LOG_DIR=os.path.join(PROJECT_DIR,'logs'); LOG_FILE=os.path.join(LOG_DIR,'audio_server.log')
+PLAYER_SCRIPT=os.path.join(PROJECT_DIR,'device_player.py')
 app=Flask(__name__); app.register_blueprint(diagnostics_bp); pygame.mixer.init(); START_TIME=time.time()
 lock=threading.RLock(); history=deque(maxlen=250); request_times=defaultdict(deque); current_sound=None; current_priority='normal'
-duck_lock=threading.Lock(); duck_generation=0; spotify_original_volumes={}; duck_active=False
+duck_lock=threading.Lock(); spotify_original_volumes={}; duck_active=False
 queue_lock=threading.Condition(); playback_queue=[]; queue_seq=0; current_item=None; stop_worker=False
+player_lock=threading.RLock(); active_players=[]
 PRIORITIES={'low':10,'normal':20,'high':30,'critical':40}
 
 def setup_logging():
@@ -100,22 +102,63 @@ def restore_spotify_volume():
     if pid in current:fade_volume(current[pid],float(current[pid].GetMasterVolume()),float(orig),int(cfg.get('fade_up_ms',2000)))
    spotify_original_volumes.clear(); duck_active=False
  finally:comtypes.CoUninitialize()
+def alert_outputs():
+ raw=SETTINGS.get('alert_outputs')
+ if not isinstance(raw,list) or not raw:return [{'device':'','volume':1.0}]
+ out=[]
+ for x in raw:
+  if not isinstance(x,dict):continue
+  out.append({'device':str(x.get('device') or '').strip(),'volume':max(0.0,min(1.0,float(x.get('volume',1.0))))})
+ return out or [{'device':'','volume':1.0}]
+def players_busy():
+ with player_lock:return any(p.poll() is None for p in active_players)
+def send_player_command(cmd):
+ with player_lock:
+  for p in list(active_players):
+   if p.poll() is not None:continue
+   try:p.stdin.write(cmd+'\n');p.stdin.flush()
+   except Exception:pass
+def stop_players():
+ send_player_command('stop');time.sleep(.08)
+ with player_lock:
+  for p in list(active_players):
+   if p.poll() is None:
+    try:p.terminate()
+    except Exception:pass
+def launch_players(path,profile):
+ procs=[]; creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)
+ for output in alert_outputs():
+  effective=max(0.0,min(1.0,float(profile['volume'])*float(output['volume'])))
+  cmd=[sys.executable,PLAYER_SCRIPT,'--file',path,'--volume',str(effective),'--fade-in-ms',str(profile['alert_fade_in_ms'])]
+  if output['device']:cmd.extend(['--device',output['device']])
+  p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,creationflags=creationflags)
+  procs.append(p)
+ with player_lock:
+  active_players.clear();active_players.extend(procs)
+ return procs
 def play_item(item):
  global current_sound,current_priority,current_item
  sounds=scan_sounds(); name=item['sound']
  if name not in sounds:return False,'Audio nao encontrado'
  profile=sound_profile(name); path=sounds[name]['path']; current_sound=name; current_priority=profile['priority']; current_item=item
  try:
-  apply_spotify_duck(profile)
-  with lock:
-   pygame.mixer.music.set_volume(profile['volume']); pygame.mixer.music.load(path); pygame.mixer.music.play(fade_ms=profile['alert_fade_in_ms'])
-  while pygame.mixer.music.get_busy():time.sleep(.08)
-  restore_spotify_volume(); return True,None
+  apply_spotify_duck(profile);procs=launch_players(path,profile)
+  while any(p.poll() is None for p in procs):time.sleep(.08)
+  errors=[]
+  for p in procs:
+   if p.returncode not in (0,None):
+    try:errors.append((p.stderr.read() or '').strip())
+    except Exception:errors.append(f'processo retornou {p.returncode}')
+  restore_spotify_volume()
+  if errors:return False,' | '.join(x for x in errors if x) or 'Falha em uma saída de áudio'
+  return True,None
  except Exception as exc:
+  stop_players()
   try:restore_spotify_volume()
   except Exception:pass
   return False,str(exc)
  finally:
+  with player_lock:active_players.clear()
   current_sound=None; current_priority='normal'; current_item=None
 def enqueue_sound(name,source='manual',scheduled_for=None):
  global queue_seq
@@ -124,7 +167,7 @@ def enqueue_sound(name,source='manual',scheduled_for=None):
  with queue_lock:
   queue_seq+=1; item['id']=queue_seq
   heapq.heappush(playback_queue,(-PRIORITIES[item['priority']],queue_seq,item))
-  if item['priority']=='critical' and pygame.mixer.music.get_busy():pygame.mixer.music.stop()
+  if item['priority']=='critical' and players_busy():stop_players()
   queue_lock.notify()
  return True,None,item
 def queue_worker():
@@ -157,11 +200,10 @@ def default_environments():
 def apply_environment(name):
  env=SETTINGS.get('environment_profiles',{}).get(name)
  if not env:return False
- SETTINGS['volume']=float(env.get('volume',SETTINGS.get('volume',1))); SETTINGS['maintenance']=bool(env.get('maintenance',False)); SETTINGS['ducking'].update(env.get('ducking',{})); SETTINGS['active_environment']=name; pygame.mixer.music.set_volume(SETTINGS['volume']); save_settings(); return True
+ SETTINGS['volume']=float(env.get('volume',SETTINGS.get('volume',1))); SETTINGS['maintenance']=bool(env.get('maintenance',False)); SETTINGS['ducking'].update(env.get('ducking',{})); SETTINGS['active_environment']=name; save_settings(); return True
 
-setup_logging(); SETTINGS=load_json(SETTINGS_FILE,{'volume':1.0,'maintenance':False,'allowed_ips':[],'schedules':[],'ducking':{'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000},'sound_profiles':{},'environment_profiles':default_environments(),'active_environment':'Normal'});SETTINGS.setdefault('sound_profiles',{});SETTINGS.setdefault('schedules',[]);SETTINGS.setdefault('ducking',{});SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal')
+setup_logging(); SETTINGS=load_json(SETTINGS_FILE,{'volume':1.0,'maintenance':False,'allowed_ips':[],'schedules':[],'ducking':{'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000},'sound_profiles':{},'environment_profiles':default_environments(),'active_environment':'Normal','alert_outputs':[{'device':'','volume':1.0}]});SETTINGS.setdefault('sound_profiles',{});SETTINGS.setdefault('schedules',[]);SETTINGS.setdefault('ducking',{});SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0}])
 for k,v in {'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000}.items():SETTINGS['ducking'].setdefault(k,v)
-pygame.mixer.music.set_volume(float(SETTINGS.get('volume',1.0)))
 threading.Thread(target=queue_worker,daemon=True).start()
 @app.before_request
 def protection():
@@ -176,7 +218,7 @@ def dashboard():return render_template('index.html')
 @app.get('/status')
 def status():
  cfg=SETTINGS['ducking'];sp=spotify_state();q=queue_snapshot()
- return jsonify({'status':'online','server_time':datetime.now().isoformat(timespec='seconds'),'friendly_url':'http://audioserver.local:8765/','version':version(),'uptime_seconds':int(time.time()-START_TIME),'playing':bool(pygame.mixer.music.get_busy()),'current_sound':current_sound,'current_priority':current_priority,'queue_length':len(q),'volume':round(float(SETTINGS.get('volume',1.0)),2),'sounds_count':len(scan_sounds()),'maintenance':bool(SETTINGS.get('maintenance')),'active_environment':SETTINGS.get('active_environment'),'next_schedule':next_schedule(),'spotify':sp,'ducking':{'enabled':cfg['enabled'],'active':duck_active,'spotify_volume_during_alert':cfg['duck_volume'],'fade_down_ms':cfg['fade_down_ms'],'fade_up_ms':cfg['fade_up_ms'],'restore_delay_ms':cfg['restore_delay_ms']}})
+ return jsonify({'status':'online','server_time':datetime.now().isoformat(timespec='seconds'),'friendly_url':'http://audioserver.local:8765/','version':version(),'uptime_seconds':int(time.time()-START_TIME),'playing':players_busy(),'current_sound':current_sound,'current_priority':current_priority,'queue_length':len(q),'volume':round(float(SETTINGS.get('volume',1.0)),2),'sounds_count':len(scan_sounds()),'maintenance':bool(SETTINGS.get('maintenance')),'active_environment':SETTINGS.get('active_environment'),'alert_outputs':alert_outputs(),'next_schedule':next_schedule(),'spotify':sp,'ducking':{'enabled':cfg['enabled'],'active':duck_active,'spotify_volume_during_alert':cfg['duck_volume'],'fade_down_ms':cfg['fade_down_ms'],'fade_up_ms':cfg['fade_up_ms'],'restore_delay_ms':cfg['restore_delay_ms']}})
 @app.get('/sounds')
 def sounds():
  data=scan_sounds();return jsonify({'directory':SOUNDS_DIR,'sounds':[{'name':n,**meta,'profile':sound_profile(n)} for n,meta in data.items()]})
@@ -206,16 +248,16 @@ def play():
  add_history('enqueue','ok',f"sound={name} priority={item['priority']}");return jsonify({'status':'queued','sound':name,'priority':item['priority'],'id':item['id']})
 @app.post('/stop')
 def stop():
- pygame.mixer.music.stop();add_history('stop','ok');return jsonify({'status':'stopped'})
+ stop_players();add_history('stop','ok');return jsonify({'status':'stopped'})
 @app.post('/pause')
-def pause():pygame.mixer.music.pause();add_history('pause','ok');return jsonify({'status':'paused'})
+def pause():send_player_command('pause');add_history('pause','ok');return jsonify({'status':'paused'})
 @app.post('/resume')
-def resume():pygame.mixer.music.unpause();add_history('resume','ok');return jsonify({'status':'playing'})
+def resume():send_player_command('resume');add_history('resume','ok');return jsonify({'status':'playing'})
 @app.post('/volume')
 def volume():
  v=(request.get_json(silent=True) or {}).get('volume')
  if not isinstance(v,(int,float)) or isinstance(v,bool) or not 0<=float(v)<=1:return jsonify({'error':'Volume invalido'}),400
- SETTINGS['volume']=float(v);pygame.mixer.music.set_volume(float(v));save_settings();return jsonify({'volume':float(v)})
+ SETTINGS['volume']=float(v);save_settings();return jsonify({'volume':float(v)})
 @app.post('/ducking')
 def ducking():
  data=request.get_json(silent=True) or {};cfg=SETTINGS['ducking']
@@ -227,7 +269,23 @@ def ducking():
 @app.post('/maintenance')
 def maintenance():SETTINGS['maintenance']=bool((request.get_json(silent=True) or {}).get('enabled'));save_settings();return jsonify({'maintenance':SETTINGS['maintenance']})
 @app.get('/config')
-def config():return jsonify({'allowed_ips':SETTINGS.get('allowed_ips',[]),'schedules':SETTINGS.get('schedules',[]),'sound_profiles':SETTINGS.get('sound_profiles',{}),'ducking':SETTINGS['ducking'],'environment_profiles':SETTINGS.get('environment_profiles',{}),'active_environment':SETTINGS.get('active_environment')})
+def config():return jsonify({'allowed_ips':SETTINGS.get('allowed_ips',[]),'schedules':SETTINGS.get('schedules',[]),'sound_profiles':SETTINGS.get('sound_profiles',{}),'ducking':SETTINGS['ducking'],'environment_profiles':SETTINGS.get('environment_profiles',{}),'active_environment':SETTINGS.get('active_environment'),'alert_outputs':alert_outputs()})
+@app.post('/config/alert-outputs')
+def configure_alert_outputs():
+ if players_busy():return jsonify({'error':'Pare o alerta atual antes de alterar as saídas.'}),409
+ data=request.get_json(silent=True) or {};outputs=data.get('outputs')
+ if not isinstance(outputs,list) or not outputs:return jsonify({'error':'Selecione pelo menos uma saída.'}),400
+ clean=[];seen=set()
+ for x in outputs:
+  if not isinstance(x,dict):continue
+  device=str(x.get('device') or '').strip(); volume=x.get('volume',1.0)
+  try:volume=max(0.0,min(1.0,float(volume)))
+  except Exception:return jsonify({'error':'Volume de saída inválido.'}),400
+  key=device.lower()
+  if key in seen:continue
+  seen.add(key);clean.append({'device':device,'volume':volume})
+ if not clean:return jsonify({'error':'Selecione pelo menos uma saída válida.'}),400
+ SETTINGS['alert_outputs']=clean;save_settings();add_history('alert_outputs','ok',f'count={len(clean)}');return jsonify({'outputs':clean})
 @app.get('/config/export')
 def export_config():
  payload=json.dumps(SETTINGS,ensure_ascii=False,indent=2);return Response(payload,mimetype='application/json',headers={'Content-Disposition':'attachment; filename=audioserver_config.json'})
@@ -238,7 +296,7 @@ def import_config():
  if not isinstance(data,dict):return jsonify({'error':'JSON de configuracao invalido'}),400
  required={'ducking','schedules','sound_profiles'}
  if not required.issubset(set(data.keys())):return jsonify({'error':'Arquivo nao parece ser uma configuracao do AudioServer'}),400
- backup_settings();SETTINGS=data;SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');save_settings();pygame.mixer.music.set_volume(float(SETTINGS.get('volume',1)));add_history('config_import','ok');return jsonify({'status':'imported'})
+ backup_settings();SETTINGS=data;SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0}]);save_settings();add_history('config_import','ok');return jsonify({'status':'imported'})
 @app.post('/config/schedules')
 def schedules():
  s=(request.get_json(silent=True) or {}).get('schedules')
