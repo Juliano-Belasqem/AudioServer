@@ -184,6 +184,21 @@ def configure_alerts():
 def test_alert():
  emit_alert('test','Alerta de teste do AudioServer','info'); return jsonify({'status':'sent'})
 
+@bp.after_app_request
+def inject_music_dashboard_link(response):
+ """Mantém o atalho de Música Ambiente visível no painel principal sem duplicar a lógica da página."""
+ try:
+  if request.path=='/' and response.content_type and response.content_type.startswith('text/html'):
+   text=response.get_data(as_text=True)
+   if '/static/music.html' not in text:
+    marker='<a class="linkbtn" href="/static/audio-output.html">🔊 Saída de áudio</a>'
+    replacement=marker+'<a class="linkbtn" href="/static/music.html">🎵 Música ambiente</a>'
+    if marker in text:
+     response.set_data(text.replace(marker,replacement,1))
+     response.headers['Content-Length']=len(response.get_data())
+ except Exception:pass
+ return response
+
 try:initialize_audio_device(selected_audio_device(),persist=False)
 except Exception:pass
 threading.Thread(target=audit_tail_loop,daemon=True).start()
