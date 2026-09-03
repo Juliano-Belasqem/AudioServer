@@ -34,38 +34,40 @@ def price_words(v):
   return ' e '.join(p) or 'zero reais'
  except Exception:return str(v)
 
+# Frases propositalmente curtas: o ritmo vem das pausas entre produtos, não de
+# conectivos em todas as linhas. Isso deixa a locução mais parecida com rádio de varejo.
 STYLES={
  'natural':{
-  'intro':'Atenção, pessoal! Tem oferta boa esperando por você.',
-  'leads':['Olha só essa oferta:','E tem mais:','Agora presta atenção nessa:','Outra oportunidade pra aproveitar:','E anota essa também:'],
-  'prices':['saindo por','por apenas','hoje por','você leva por','tudo isso por'],
-  'outro':'Aproveite as ofertas, passe pelos nossos corredores e boas compras!'},
+  'intro':'Atenção para as ofertas!',
+  'leads':['Olha só:','','','Confira:','',''],
+  'prices':['por','por apenas','só','por','por apenas','só'],
+  'outro':'Aproveite as ofertas e boas compras!'},
  'animated':{
-  'intro':'Atenção! É hora de aproveitar ofertas que valem a pena!',
-  'leads':['Começando com essa super oferta:','E tem mais economia:','Olha essa oportunidade:','Corre pra aproveitar:','E não para por aí:'],
-  'prices':['por apenas','é seu por','saindo por','hoje, só','por incríveis'],
-  'outro':'Não deixe para depois! Aproveite enquanto durarem os estoques e boas compras!'},
+  'intro':'Atenção! Ofertas especiais para você!',
+  'leads':['Super oferta:','','Olha essa:','','Aproveite:',''],
+  'prices':['por apenas','só','por','só','por apenas','por'],
+  'outro':'Aproveite! Ofertas por tempo limitado. Boas compras!'},
  'institutional':{
-  'intro':'Confira algumas ofertas selecionadas especialmente para você.',
-  'leads':['Começamos com:','Também temos:','Outra boa opção é:','Confira ainda:','E para completar:'],
-  'prices':['por','no valor de','saindo por','por apenas','disponível por'],
-  'outro':'Agradecemos a preferência. Aproveite nossas ofertas e tenha boas compras!'},
+  'intro':'Confira nossas ofertas.',
+  'leads':['','','Confira também:','','',''],
+  'prices':['por','por','por apenas','por','por','por apenas'],
+  'outro':'Aproveite nossas ofertas. Agradecemos a preferência!'},
  'fresh':{
-  'intro':'Olha a oferta fresquinha passando por aqui!',
-  'leads':['Pra começar:','Olha que oportunidade:','Tem mais coisa boa:','E aproveita também:','Pra levar pra casa:'],
-  'prices':['por apenas','saindo por','hoje por','você leva por','só'],
-  'outro':'Passe pelo setor, escolha os seus favoritos e aproveite! Boas compras!'}
+  'intro':'Ofertas fresquinhas para você!',
+  'leads':['Olha só:','','Aproveite:','','',''],
+  'prices':['por','só','por apenas','por','só','por'],
+  'outro':'Aproveite as ofertas do setor e boas compras!'}
 }
 
 def build_script(name,items,intro='',outro='',script_style='natural'):
  style=STYLES.get(script_style,STYLES['natural']);valid=[x for x in items if str(x.get('product') or '').strip()];parts=[intro.strip() or style['intro']];total=len(valid)
  for i,x in enumerate(valid):
   product=str(x.get('product') or '').strip();detail=str(x.get('detail') or '').strip();lead=style['leads'][i%len(style['leads'])];pricelead=style['prices'][i%len(style['prices'])]
-  # Locuções longas ficam mais enxutas para não cansar o cliente.
-  if total>=7 and i>0:lead=['E mais:','Também tem:','Aproveite:','Olha essa:'][i%4]
+  # Em listas grandes eliminamos quase todos os conectivos e deixamos produto/preço respirar.
+  if total>=7:lead='Confira:' if i and i%4==0 else ''
   desc=f'{product}{", " + detail if detail else ""}'
-  parts.append(f'{lead} {desc}... {pricelead} {price_words(x.get("price",""))}!')
-  if total>=8 and (i+1)%4==0 and i+1<total:parts.append('E ainda tem mais oferta boa pra você!')
+  prefix=(lead+' ') if lead else ''
+  parts.append(f'{prefix}{desc}... {pricelead} {price_words(x.get("price",""))}!')
  parts.append(outro.strip() or style['outro']);return '\n\n'.join(parts)
 
 def save_campaign(payload):
