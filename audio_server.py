@@ -7,6 +7,7 @@ import pygame
 from pycaw.pycaw import AudioUtilities
 import comtypes
 from diagnostics import bp as diagnostics_bp
+from offers import bp as offers_bp
 from network_service import start_mdns
 from music_provider import get_provider, provider_catalog
 
@@ -15,7 +16,7 @@ SOUNDS_DIR=r'C:\Sounds'; SUPPORTED_EXTENSIONS={'.mp3','.wav','.ogg','.flac'}
 SETTINGS_FILE=os.path.join(PROJECT_DIR,'local_settings.json'); BACKUP_DIR=os.path.join(PROJECT_DIR,'backups')
 LOG_DIR=os.path.join(PROJECT_DIR,'logs'); LOG_FILE=os.path.join(LOG_DIR,'audio_server.log')
 PLAYER_SCRIPT=os.path.join(PROJECT_DIR,'device_player.py')
-app=Flask(__name__); app.register_blueprint(diagnostics_bp); pygame.mixer.init(); START_TIME=time.time()
+app=Flask(__name__); app.register_blueprint(diagnostics_bp); app.register_blueprint(offers_bp); pygame.mixer.init(); START_TIME=time.time()
 lock=threading.RLock(); history=deque(maxlen=250); request_times=defaultdict(deque); current_sound=None; current_priority='normal'
 duck_lock=threading.Lock(); spotify_original_volumes={}; duck_active=False
 queue_lock=threading.Condition(); playback_queue=[]; queue_seq=0; current_item=None; stop_worker=False
@@ -417,8 +418,8 @@ def configure_alert_outputs():
  clean=[];seen=set()
  for x in outputs:
   if not isinstance(x,dict):continue
-  device=str(x.get('device') or '').strip();volume=x.get('volume',1.0)
-  try:volume=max(0.0,min(1.0,float(volume)));delay=max(0,min(5000,int(x.get('delay_ms',0))))
+  device=str(x.get('device') or '').strip(); volume=x.get('volume',1.0); delay=x.get('delay_ms',0)
+  try:volume=max(0.0,min(1.0,float(volume)));delay=max(0,min(5000,int(delay)))
   except Exception:return jsonify({'error':'Volume ou atraso de saída inválido.'}),400
   key=device.lower()
   if key in seen:continue
@@ -469,10 +470,8 @@ def environments_delete():
  name=(request.get_json(silent=True) or {}).get('name')
  if name in ('Normal','Baixo volume','Evento','Manutencao'):return jsonify({'error':'Perfil padrao nao pode ser removido'}),400
  SETTINGS.setdefault('environment_profiles',{}).pop(name,None);save_settings();return jsonify({'environment_profiles':SETTINGS['environment_profiles']})
-
-
 def scheduler():
- fired=set();last_music_target='';last_music_attempt=0
+ fired=set();last_music_profile=None
  while True:
   now=datetime.now();key=now.strftime('%Y-%m-%d %H:%M')
   for i,s in enumerate(list(SETTINGS.get('schedules',[]))):
@@ -486,15 +485,14 @@ def scheduler():
      ok,err,item=enqueue_sound(s.get('sound'),'schedule',key);add_history('schedule_enqueue','ok' if ok else 'error',f"sound={s.get('sound')} error={err or ''}",key)
     fired.add(marker)
    except Exception as exc:app.logger.error('scheduler error=%s',exc)
-  fired={x for x in fired if x.startswith(now.strftime('%Y-%m-%d'))}
   try:
-   target=music_schedule_target(now);target_name=target.get('profile') if target else ''
-   active=ensure_music_config().get('active_profile','')
-   if target_name and target_name!=active and (target_name!=last_music_target or time.time()-last_music_attempt>=300):
-    last_music_target=target_name;last_music_attempt=time.time();ok,err=apply_music_profile(target_name,'schedule')
-    if not ok:add_history('music_profile_schedule','error',f'name={target_name} error={err or ""}',target.get('datetime'))
+   target=music_schedule_target(now);wanted=target.get('profile') if target else None
+   current=ensure_music_config().get('active_profile')
+   if wanted and wanted!=current:
+    ok,err=apply_music_profile(wanted,'schedule');
+    if not ok:app.logger.warning('music schedule profile=%s error=%s',wanted,err)
   except Exception as exc:app.logger.error('music scheduler error=%s',exc)
-  time.sleep(10)
+  fired={x for x in fired if x.startswith(now.strftime('%Y-%m-%d'))};time.sleep(10)
 threading.Thread(target=scheduler,daemon=True).start()
 if __name__=='__main__':
  start_mdns(8765)
