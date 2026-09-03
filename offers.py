@@ -12,7 +12,8 @@ bp=Blueprint('offers',__name__)
 
 DEFAULT_SETTINGS={
     'voice_id':'','model_id':'eleven_multilingual_v2','preset':'comercial',
-    'stability':0.38,'similarity_boost':0.78,'style':0.18,'speed':0.96,'use_speaker_boost':True
+    'stability':0.38,'similarity_boost':0.78,'style':0.18,
+    'speed':0.96,'use_speaker_boost':True
 }
 
 def _load():
@@ -23,20 +24,27 @@ def _load():
     for k,v in DEFAULT_SETTINGS.items():cfg.setdefault(k,v)
     data.setdefault('campaigns',[])
     return data
+
 def _save(data):
     with open(DATA_FILE,'w',encoding='utf-8') as f:json.dump(data,f,ensure_ascii=False,indent=2)
+
 def settings():return _load()['settings']
+
 def save_settings(payload):
     data=_load();old=data['settings'];cfg=dict(DEFAULT_SETTINGS)
     cfg['voice_id']=str(payload.get('voice_id',old.get('voice_id','')) or '').strip()
     cfg['model_id']=str(payload.get('model_id',old.get('model_id','eleven_multilingual_v2')) or 'eleven_multilingual_v2').strip()
     cfg['preset']=str(payload.get('preset',old.get('preset','comercial')) or 'comercial')
     for key,default in [('stability',.38),('similarity_boost',.78),('style',.18),('speed',.96)]:
-        try:cfg[key]=max(0.0,min(1.2 if key=='speed' else 1.0,float(payload.get(key,old.get(key,default)))))
+        try:cfg[key]=float(payload.get(key,old.get(key,default)))
         except Exception:cfg[key]=default
+    cfg['stability']=max(0,min(1,cfg['stability']))
+    cfg['similarity_boost']=max(0,min(1,cfg['similarity_boost']))
+    cfg['style']=max(0,min(1,cfg['style']))
     cfg['speed']=max(.7,min(1.2,cfg['speed']))
     cfg['use_speaker_boost']=bool(payload.get('use_speaker_boost',old.get('use_speaker_boost',True)))
     data['settings']=cfg;_save(data);return cfg
+
 def list_campaigns():return _load().get('campaigns',[])
 
-_ONES=['zero','um','dois','três','quatro','cinco','seis','sete','oito','nove','dez','onze','doze','treze','quatorze','quinze','dezesseis','dezess
+ONES=['zero','um','dois','três','quatro','cinco','seis','sete','oito','nove','dez','onze','doze','treze','quatorze','quinze','dezesseis','dezessete
