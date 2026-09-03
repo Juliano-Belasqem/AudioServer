@@ -1,10 +1,11 @@
 """Campanhas de ofertas e geração de locução via ElevenLabs."""
-import json, os, re, urllib.request, urllib.error, uuid
+import json, os, re, urllib.request, urllib.error, uuid, shutil, subprocess
 from datetime import datetime
 from flask import Blueprint, jsonify, request, send_file
 from num2words import num2words
+import imageio_ffmpeg
 
-PROJECT_DIR=os.path.dirname(os.path.abspath(__file__)); DATA_FILE=os.path.join(PROJECT_DIR,'offers.json'); OUTPUT_DIR=r'C:\Sounds\Ofertas'; bp=Blueprint('offers',__name__)
+PROJECT_DIR=os.path.dirname(os.path.abspath(__file__)); DATA_FILE=os.path.join(PROJECT_DIR,'offers.json'); OUTPUT_DIR=r'C:\Sounds\Ofertas'; AUDIO_BACKUP_DIR=os.path.join(PROJECT_DIR,'backups','audio'); bp=Blueprint('offers',__name__)
 V3_STABILITIES=(0.0,0.5,1.0)
 
 def _v3_stability(value):
@@ -34,39 +35,19 @@ def price_words(v):
   return ' e '.join(p) or 'zero reais'
  except Exception:return str(v)
 
-# Frases propositalmente curtas: o ritmo vem das pausas entre produtos, não de
-# conectivos em todas as linhas. Isso deixa a locução mais parecida com rádio de varejo.
 STYLES={
- 'natural':{
-  'intro':'Atenção para as ofertas!',
-  'leads':['Olha só:','','','Confira:','',''],
-  'prices':['por','por apenas','só','por','por apenas','só'],
-  'outro':'Aproveite as ofertas e boas compras!'},
- 'animated':{
-  'intro':'Atenção! Ofertas especiais para você!',
-  'leads':['Super oferta:','','Olha essa:','','Aproveite:',''],
-  'prices':['por apenas','só','por','só','por apenas','por'],
-  'outro':'Aproveite! Ofertas por tempo limitado. Boas compras!'},
- 'institutional':{
-  'intro':'Confira nossas ofertas.',
-  'leads':['','','Confira também:','','',''],
-  'prices':['por','por','por apenas','por','por','por apenas'],
-  'outro':'Aproveite nossas ofertas. Agradecemos a preferência!'},
- 'fresh':{
-  'intro':'Ofertas fresquinhas para você!',
-  'leads':['Olha só:','','Aproveite:','','',''],
-  'prices':['por','só','por apenas','por','só','por'],
-  'outro':'Aproveite as ofertas do setor e boas compras!'}
+ 'natural':{'intro':'Atenção para as ofertas!','leads':['Olha só:','','','Confira:','',''],'prices':['por','por apenas','só','por','por apenas','só'],'outro':'Aproveite as ofertas e boas compras!'},
+ 'animated':{'intro':'Atenção! Ofertas especiais para você!','leads':['Super oferta:','','Olha essa:','','Aproveite:',''],'prices':['por apenas','só','por','só','por apenas','por'],'outro':'Aproveite! Ofertas por tempo limitado. Boas compras!'},
+ 'institutional':{'intro':'Confira nossas ofertas.','leads':['','','Confira também:','','',''],'prices':['por','por','por apenas','por','por','por apenas'],'outro':'Aproveite nossas ofertas. Agradecemos a preferência!'},
+ 'fresh':{'intro':'Ofertas fresquinhas para você!','leads':['Olha só:','','Aproveite:','','',''],'prices':['por','só','por apenas','por','só','por'],'outro':'Aproveite as ofertas do setor e boas compras!'}
 }
 
 def build_script(name,items,intro='',outro='',script_style='natural'):
  style=STYLES.get(script_style,STYLES['natural']);valid=[x for x in items if str(x.get('product') or '').strip()];parts=[intro.strip() or style['intro']];total=len(valid)
  for i,x in enumerate(valid):
   product=str(x.get('product') or '').strip();detail=str(x.get('detail') or '').strip();lead=style['leads'][i%len(style['leads'])];pricelead=style['prices'][i%len(style['prices'])]
-  # Em listas grandes eliminamos quase todos os conectivos e deixamos produto/preço respirar.
   if total>=7:lead='Confira:' if i and i%4==0 else ''
-  desc=f'{product}{", " + detail if detail else ""}'
-  prefix=(lead+' ') if lead else ''
+  desc=f'{product}{", " + detail if detail else ""}';prefix=(lead+' ') if lead else ''
   parts.append(f'{prefix}{desc}... {pricelead} {price_words(x.get("price",""))}!')
  parts.append(outro.strip() or style['outro']);return '\n\n'.join(parts)
 
@@ -79,6 +60,7 @@ def save_campaign(payload):
  if old:
   c['created_at']=old.get('created_at',now);c['audio_sound']=c['audio_sound'] or old.get('audio_sound','')
   if old.get('audio_generated_at'):c['audio_generated_at']=old['audio_generated_at']
+  if old.get('audio_edited_at'):c['audio_edited_at']=old['audio_edited_at']
   cs[cs.index(old)]=c
  else:c['created_at']=now;cs.append(c)
  _save(data);return c
@@ -93,6 +75,48 @@ def set_status(cid,status):
   if c.get('id')==cid:c['workflow_status']=status;c['enabled']=status=='published';c['updated_at']=datetime.now().isoformat(timespec='seconds');found=c;break
  if found:_save(data)
  return bool(found),found
+
+def _safe_float(value,default=0.0):
+ try:return float(value)
+ except Exception:return default
+
+def edit_audio(cid,payload):
+ c=get_campaign(cid);src=audio_path(c)
+ if not c or not src:return False,'Narração não encontrada.',None
+ start=max(0.0,_safe_float(payload.get('start'),0));end=_safe_float(payload.get('end'),0);volume=max(0.0,min(3.0,_safe_float(payload.get('volume'),1.0)));fade_in=max(0.0,min(10.0,_safe_float(payload.get('fade_in'),0)));fade_out=max(0.0,min(10.0,_safe_float(payload.get('fade_out'),0)))
+ if end<=start:return False,'O fim precisa ser maior que o início.',None
+ duration=end-start
+ fade_in=min(fade_in,duration/2);fade_out=min(fade_out,duration/2)
+ os.makedirs(AUDIO_BACKUP_DIR,exist_ok=True);stamp=datetime.now().strftime('%Y%m%d_%H%M%S');backup=os.path.join(AUDIO_BACKUP_DIR,f'{os.path.basename(src)}.{stamp}.bak.mp3');shutil.copy2(src,backup)
+ temp=src+'.editing.mp3';filters=[f'volume={volume:.4f}']
+ if fade_in>0:filters.append(f'afade=t=in:st=0:d={fade_in:.3f}')
+ if fade_out>0:filters.append(f'afade=t=out:st={max(0,duration-fade_out):.3f}:d={fade_out:.3f}')
+ cmd=[imageio_ffmpeg.get_ffmpeg_exe(),'-y','-hide_banner','-loglevel','error','-ss',f'{start:.3f}','-t',f'{duration:.3f}','-i',src,'-vn','-af',','.join(filters),'-codec:a','libmp3lame','-b:a','192k',temp]
+ try:
+  p=subprocess.run(cmd,capture_output=True,text=True,timeout=120)
+  if p.returncode!=0:return False,(p.stderr or 'Falha ao editar o áudio.')[-700:],None
+  os.replace(temp,src)
+ except Exception as exc:
+  try:
+   if os.path.exists(temp):os.remove(temp)
+  except Exception:pass
+  return False,str(exc),None
+ data=_load()
+ for x in data['campaigns']:
+  if x.get('id')==cid:
+   x['audio_edited_at']=datetime.now().isoformat(timespec='seconds');x['workflow_status']='narrated';x['enabled']=False;x['last_audio_backup']=backup
+ _save(data)
+ return True,None,backup
+
+def restore_last_audio(cid):
+ c=get_campaign(cid);src=audio_path(c);backup=str((c or {}).get('last_audio_backup') or '')
+ if not c or not src or not backup or not os.path.isfile(backup):return False,'Backup anterior não encontrado.'
+ try:shutil.copy2(backup,src)
+ except Exception as exc:return False,str(exc)
+ data=_load()
+ for x in data['campaigns']:
+  if x.get('id')==cid:x['audio_edited_at']=datetime.now().isoformat(timespec='seconds');x['workflow_status']='narrated';x['enabled']=False
+ _save(data);return True,None
 
 def generate_audio(cid):
  key=os.environ.get('ELEVENLABS_API_KEY','').strip();cfg=settings();voice=str(cfg.get('voice_id','')).strip();c=get_campaign(cid)
@@ -138,6 +162,15 @@ def offers_audio(cid):
  p=audio_path(get_campaign(cid))
  if not p:return jsonify({'error':'Narração não encontrada'}),404
  return send_file(p,mimetype='audio/mpeg',conditional=True,download_name=os.path.basename(p))
+@bp.post('/offers/audio-edit')
+def offers_audio_edit():
+ d=request.get_json(silent=True) or {};cid=str(d.get('id') or '');ok,err,backup=edit_audio(cid,d)
+ if not ok:return jsonify({'error':err}),409
+ return jsonify({'status':'edited','backup_created':bool(backup),'preview_url':f'/offers/audio/{cid}?t={int(datetime.now().timestamp())}'})
+@bp.post('/offers/audio-restore')
+def offers_audio_restore():
+ d=request.get_json(silent=True) or {};cid=str(d.get('id') or '');ok,err=restore_last_audio(cid)
+ return jsonify({'status':'restored'}) if ok else (jsonify({'error':err}),409)
 @bp.post('/offers/status')
 def offers_status():
  d=request.get_json(silent=True) or {};ok,c=set_status(str(d.get('id') or ''),str(d.get('status') or ''))
