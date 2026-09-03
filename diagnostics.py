@@ -145,26 +145,6 @@ def configure_alerts():
 @bp.post('/diagnostics/test-alert')
 def test_alert():emit_alert('test','Alerta de teste do AudioServer','info');return jsonify({'status':'sent'})
 
-@bp.get('/offers')
-def offers_get():return jsonify({'campaigns':offers.list_campaigns(),'settings':offers.settings(),'api_key_configured':bool(os.environ.get('ELEVENLABS_API_KEY','').strip())})
-@bp.post('/offers/settings')
-def offers_settings():
- d=request.get_json(silent=True) or {};return jsonify(offers.save_settings(d.get('voice_id'),d.get('model_id')))
-@bp.post('/offers/script')
-def offers_script():
- d=request.get_json(silent=True) or {};return jsonify({'script':offers.build_script(d.get('name','Ofertas'),d.get('items',[]),d.get('intro',''),d.get('outro',''))})
-@bp.post('/offers/campaigns')
-def offers_save():
- try:return jsonify({'campaign':offers.save_campaign(request.get_json(silent=True) or {})})
- except Exception as exc:return jsonify({'error':str(exc)}),400
-@bp.post('/offers/campaigns/delete')
-def offers_delete():return jsonify({'deleted':offers.delete_campaign(str((request.get_json(silent=True) or {}).get('id') or ''))})
-@bp.post('/offers/narrate')
-def offers_narrate():
- cid=str((request.get_json(silent=True) or {}).get('id') or '');ok,err,path=offers.generate_audio(cid)
- if not ok:return jsonify({'error':err}),409
- return jsonify({'status':'ok','path':path,'sound':os.path.splitext(os.path.basename(path))[0]})
-
 @bp.after_app_request
 def inject_dashboard_links(response):
  try:
