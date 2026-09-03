@@ -8,6 +8,7 @@ from pycaw.pycaw import AudioUtilities
 import comtypes
 from diagnostics import bp as diagnostics_bp
 from network_service import start_mdns
+from music_provider import get_provider, provider_catalog
 
 PROJECT_DIR=os.path.dirname(os.path.abspath(__file__))
 SOUNDS_DIR=r'C:\Sounds'; SUPPORTED_EXTENSIONS={'.mp3','.wav','.ogg','.flac'}
@@ -202,7 +203,7 @@ def apply_environment(name):
  if not env:return False
  SETTINGS['volume']=float(env.get('volume',SETTINGS.get('volume',1))); SETTINGS['maintenance']=bool(env.get('maintenance',False)); SETTINGS['ducking'].update(env.get('ducking',{})); SETTINGS['active_environment']=name; save_settings(); return True
 
-setup_logging(); SETTINGS=load_json(SETTINGS_FILE,{'volume':1.0,'maintenance':False,'allowed_ips':[],'schedules':[],'ducking':{'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000},'sound_profiles':{},'environment_profiles':default_environments(),'active_environment':'Normal','alert_outputs':[{'device':'','volume':1.0}]});SETTINGS.setdefault('sound_profiles',{});SETTINGS.setdefault('schedules',[]);SETTINGS.setdefault('ducking',{});SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0}])
+setup_logging(); SETTINGS=load_json(SETTINGS_FILE,{'volume':1.0,'maintenance':False,'allowed_ips':[],'schedules':[],'ducking':{'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000},'sound_profiles':{},'environment_profiles':default_environments(),'active_environment':'Normal','alert_outputs':[{'device':'','volume':1.0}],'music':{'provider':'spotify'}});SETTINGS.setdefault('sound_profiles',{});SETTINGS.setdefault('schedules',[]);SETTINGS.setdefault('ducking',{});SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0}]);SETTINGS.setdefault('music',{'provider':'spotify'})
 for k,v in {'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000}.items():SETTINGS['ducking'].setdefault(k,v)
 threading.Thread(target=queue_worker,daemon=True).start()
 @app.before_request
@@ -219,6 +220,24 @@ def dashboard():return render_template('index.html')
 def status():
  cfg=SETTINGS['ducking'];sp=spotify_state();q=queue_snapshot()
  return jsonify({'status':'online','server_time':datetime.now().isoformat(timespec='seconds'),'friendly_url':'http://audioserver.local:8765/','version':version(),'uptime_seconds':int(time.time()-START_TIME),'playing':players_busy(),'current_sound':current_sound,'current_priority':current_priority,'queue_length':len(q),'volume':round(float(SETTINGS.get('volume',1.0)),2),'sounds_count':len(scan_sounds()),'maintenance':bool(SETTINGS.get('maintenance')),'active_environment':SETTINGS.get('active_environment'),'alert_outputs':alert_outputs(),'next_schedule':next_schedule(),'spotify':sp,'ducking':{'enabled':cfg['enabled'],'active':duck_active,'spotify_volume_during_alert':cfg['duck_volume'],'fade_down_ms':cfg['fade_down_ms'],'fade_up_ms':cfg['fade_up_ms'],'restore_delay_ms':cfg['restore_delay_ms']}})
+@app.get('/music/status')
+def music_status():
+ pid=SETTINGS.get('music',{}).get('provider','spotify'); p=get_provider(pid); data=p.status();data['providers']=provider_catalog();return jsonify(data)
+@app.post('/music/command')
+def music_command():
+ data=request.get_json(silent=True) or {};cmd=str(data.get('command') or '');p=get_provider(SETTINGS.get('music',{}).get('provider','spotify'))
+ if cmd=='volume':ok,err=p.set_volume(data.get('value',1.0)) if hasattr(p,'set_volume') else (False,'Volume não suportado')
+ else:ok,err=p.command(cmd)
+ add_history('music_command','ok' if ok else 'error',f'provider={p.id} command={cmd} error={err or ""}')
+ if not ok:return jsonify({'error':err}),409
+ return jsonify({'status':'ok',**p.status()})
+@app.post('/music/provider')
+def music_provider_select():
+ pid=str((request.get_json(silent=True) or {}).get('provider') or '')
+ available={x['id']:x for x in provider_catalog()}
+ if pid not in available:return jsonify({'error':'Provedor desconhecido'}),400
+ if not available[pid]['implemented']:return jsonify({'error':'Esse provedor ainda não foi implementado.'}),409
+ SETTINGS.setdefault('music',{})['provider']=pid;save_settings();add_history('music_provider','ok',pid);return jsonify({'provider':pid})
 @app.get('/sounds')
 def sounds():
  data=scan_sounds();return jsonify({'directory':SOUNDS_DIR,'sounds':[{'name':n,**meta,'profile':sound_profile(n)} for n,meta in data.items()]})
@@ -247,8 +266,7 @@ def play():
  if not ok:add_history('play','error',f'sound={name} error={err}');return jsonify({'error':err}),404
  add_history('enqueue','ok',f"sound={name} priority={item['priority']}");return jsonify({'status':'queued','sound':name,'priority':item['priority'],'id':item['id']})
 @app.post('/stop')
-def stop():
- stop_players();add_history('stop','ok');return jsonify({'status':'stopped'})
+def stop():stop_players();add_history('stop','ok');return jsonify({'status':'stopped'})
 @app.post('/pause')
 def pause():send_player_command('pause');add_history('pause','ok');return jsonify({'status':'paused'})
 @app.post('/resume')
@@ -269,7 +287,7 @@ def ducking():
 @app.post('/maintenance')
 def maintenance():SETTINGS['maintenance']=bool((request.get_json(silent=True) or {}).get('enabled'));save_settings();return jsonify({'maintenance':SETTINGS['maintenance']})
 @app.get('/config')
-def config():return jsonify({'allowed_ips':SETTINGS.get('allowed_ips',[]),'schedules':SETTINGS.get('schedules',[]),'sound_profiles':SETTINGS.get('sound_profiles',{}),'ducking':SETTINGS['ducking'],'environment_profiles':SETTINGS.get('environment_profiles',{}),'active_environment':SETTINGS.get('active_environment'),'alert_outputs':alert_outputs()})
+def config():return jsonify({'allowed_ips':SETTINGS.get('allowed_ips',[]),'schedules':SETTINGS.get('schedules',[]),'sound_profiles':SETTINGS.get('sound_profiles',{}),'ducking':SETTINGS['ducking'],'environment_profiles':SETTINGS.get('environment_profiles',{}),'active_environment':SETTINGS.get('active_environment'),'alert_outputs':alert_outputs(),'music':SETTINGS.get('music',{})})
 @app.post('/config/alert-outputs')
 def configure_alert_outputs():
  if players_busy():return jsonify({'error':'Pare o alerta atual antes de alterar as saídas.'}),409
@@ -296,7 +314,7 @@ def import_config():
  if not isinstance(data,dict):return jsonify({'error':'JSON de configuracao invalido'}),400
  required={'ducking','schedules','sound_profiles'}
  if not required.issubset(set(data.keys())):return jsonify({'error':'Arquivo nao parece ser uma configuracao do AudioServer'}),400
- backup_settings();SETTINGS=data;SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0}]);save_settings();add_history('config_import','ok');return jsonify({'status':'imported'})
+ backup_settings();SETTINGS=data;SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0}]);SETTINGS.setdefault('music',{'provider':'spotify'});save_settings();add_history('config_import','ok');return jsonify({'status':'imported'})
 @app.post('/config/schedules')
 def schedules():
  s=(request.get_json(silent=True) or {}).get('schedules')
