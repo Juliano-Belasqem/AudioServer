@@ -22,6 +22,7 @@ queue_lock=threading.Condition(); playback_queue=[]; queue_seq=0; current_item=N
 player_lock=threading.RLock(); active_players=[]
 PRIORITIES={'low':10,'normal':20,'high':30,'critical':40}
 
+
 def setup_logging():
  os.makedirs(LOG_DIR,exist_ok=True); h=RotatingFileHandler(LOG_FILE,maxBytes=2*1024*1024,backupCount=5,encoding='utf-8'); h.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')); app.logger.setLevel(logging.INFO); app.logger.addHandler(h)
 def load_json(path,default):
@@ -48,6 +49,8 @@ def add_history(action,result,details='',scheduled_for=None):
  item={'time':datetime.now().isoformat(timespec='seconds'),'ip':origin or 'scheduler','action':action,'result':result,'details':details}
  if scheduled_for:item['scheduled_for']=scheduled_for
  history.appendleft(item); app.logger.info('action=%s | result=%s | %s',action,result,details)
+
+
 def scan_sounds():
  sounds={}; stems={}; files=[]
  if not os.path.isdir(SOUNDS_DIR):return sounds
@@ -63,6 +66,8 @@ def sound_profile(name):
  p=SETTINGS.setdefault('sound_profiles',{}).get(name,{})
  priority=p.get('priority','normal'); priority=priority if priority in PRIORITIES else 'normal'
  return {'volume':float(p.get('volume',SETTINGS.get('volume',1.0))),'duck_enabled':bool(p.get('duck_enabled',SETTINGS.get('ducking',{}).get('enabled',True))),'duck_volume':float(p.get('duck_volume',SETTINGS.get('ducking',{}).get('duck_volume',0.2))),'alert_fade_in_ms':int(p.get('alert_fade_in_ms',300)),'alert_fade_out_ms':int(p.get('alert_fade_out_ms',400)),'favorite':bool(p.get('favorite',False)),'priority':priority}
+
+
 def spotify_state():
  comtypes.CoInitialize(); found=False; vols=[]
  try:
@@ -103,14 +108,18 @@ def restore_spotify_volume():
     if pid in current:fade_volume(current[pid],float(current[pid].GetMasterVolume()),float(orig),int(cfg.get('fade_up_ms',2000)))
    spotify_original_volumes.clear(); duck_active=False
  finally:comtypes.CoUninitialize()
+
+
 def alert_outputs():
  raw=SETTINGS.get('alert_outputs')
- if not isinstance(raw,list) or not raw:return [{'device':'','volume':1.0}]
+ if not isinstance(raw,list) or not raw:return [{'device':'','volume':1.0,'delay_ms':0}]
  out=[]
  for x in raw:
   if not isinstance(x,dict):continue
-  out.append({'device':str(x.get('device') or '').strip(),'volume':max(0.0,min(1.0,float(x.get('volume',1.0))))})
- return out or [{'device':'','volume':1.0}]
+  try:delay=max(0,min(5000,int(x.get('delay_ms',0))))
+  except Exception:delay=0
+  out.append({'device':str(x.get('device') or '').strip(),'volume':max(0.0,min(1.0,float(x.get('volume',1.0)))),'delay_ms':delay})
+ return out or [{'device':'','volume':1.0,'delay_ms':0}]
 def players_busy():
  with player_lock:return any(p.poll() is None for p in active_players)
 def send_player_command(cmd):
@@ -130,7 +139,7 @@ def launch_players(path,profile):
  procs=[]; creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)
  for output in alert_outputs():
   effective=max(0.0,min(1.0,float(profile['volume'])*float(output['volume'])))
-  cmd=[sys.executable,PLAYER_SCRIPT,'--file',path,'--volume',str(effective),'--fade-in-ms',str(profile['alert_fade_in_ms'])]
+  cmd=[sys.executable,PLAYER_SCRIPT,'--file',path,'--volume',str(effective),'--fade-in-ms',str(profile['alert_fade_in_ms']),'--delay-ms',str(output.get('delay_ms',0))]
   if output['device']:cmd.extend(['--device',output['device']])
   p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,creationflags=creationflags)
   procs.append(p)
@@ -182,6 +191,8 @@ def queue_snapshot():
  with queue_lock:
   ordered=sorted(playback_queue)
   return [dict(x[2]) for x in ordered]
+
+
 def next_schedule():
  now=datetime.now(); candidates=[]
  for s in SETTINGS.get('schedules',[]):
@@ -203,9 +214,76 @@ def apply_environment(name):
  if not env:return False
  SETTINGS['volume']=float(env.get('volume',SETTINGS.get('volume',1))); SETTINGS['maintenance']=bool(env.get('maintenance',False)); SETTINGS['ducking'].update(env.get('ducking',{})); SETTINGS['active_environment']=name; save_settings(); return True
 
-setup_logging(); SETTINGS=load_json(SETTINGS_FILE,{'volume':1.0,'maintenance':False,'allowed_ips':[],'schedules':[],'ducking':{'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000},'sound_profiles':{},'environment_profiles':default_environments(),'active_environment':'Normal','alert_outputs':[{'device':'','volume':1.0}],'music':{'provider':'spotify'}});SETTINGS.setdefault('sound_profiles',{});SETTINGS.setdefault('schedules',[]);SETTINGS.setdefault('ducking',{});SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0}]);SETTINGS.setdefault('music',{'provider':'spotify'})
+
+def default_music_profiles():
+ return {
+  'Manhã':{'provider':'spotify','volume':0.55,'content_ref':'','notes':'Clima leve para abertura e período da manhã.'},
+  'Tarde':{'provider':'spotify','volume':0.65,'content_ref':'','notes':'Perfil padrão para maior movimento durante a tarde.'},
+  'Noite':{'provider':'spotify','volume':0.50,'content_ref':'','notes':'Volume mais baixo e ambiente mais calmo.'},
+  'Fechamento':{'provider':'spotify','volume':0.40,'content_ref':'','notes':'Perfil para o período final de funcionamento.'},
+ }
+def ensure_music_config():
+ cfg=SETTINGS.setdefault('music',{})
+ cfg.setdefault('provider','spotify');cfg.setdefault('profiles',default_music_profiles());cfg.setdefault('schedule',[]);cfg.setdefault('active_profile','')
+ return cfg
+def clean_music_profile(data):
+ provider=str(data.get('provider') or 'spotify'); catalog={x['id']:x for x in provider_catalog()}
+ if provider not in catalog or not catalog[provider].get('implemented'):provider='spotify'
+ try:volume=max(0.0,min(1.0,float(data.get('volume',0.6))))
+ except Exception:volume=0.6
+ return {'provider':provider,'volume':volume,'content_ref':str(data.get('content_ref') or '').strip(),'notes':str(data.get('notes') or '').strip()[:500]}
+def apply_music_profile(name,source='manual'):
+ cfg=ensure_music_config(); profile=cfg.get('profiles',{}).get(name)
+ if not profile:return False,'Perfil musical não encontrado'
+ profile=clean_music_profile(profile);p=get_provider(profile['provider']);warnings=[]
+ if hasattr(p,'set_volume'):
+  ok,err=p.set_volume(profile['volume'])
+  if not ok:return False,err or 'Não foi possível ajustar o volume'
+ if profile.get('content_ref'):
+  if hasattr(p,'select_content'):
+   ok,err=p.select_content(profile['content_ref'])
+   if not ok:warnings.append(err or 'Conteúdo não selecionado')
+  else:warnings.append('Este provedor ainda não permite selecionar playlist/conteúdo automaticamente')
+ cfg['provider']=profile['provider'];cfg['active_profile']=name;save_settings();add_history('music_profile_apply','ok',f'name={name} source={source} provider={profile["provider"]} warnings={"; ".join(warnings)}')
+ return True,'; '.join(warnings) if warnings else None
+def music_schedule_target(now=None):
+ now=now or datetime.now();cfg=ensure_music_config();best=None
+ for s in cfg.get('schedule',[]):
+  if not isinstance(s,dict) or not s.get('enabled',True) or not s.get('profile') or not s.get('time'):continue
+  if s.get('profile') not in cfg.get('profiles',{}):continue
+  try:h,m=map(int,str(s['time']).split(':'))
+  except Exception:continue
+  days=s.get('weekdays',[])
+  for back in range(8):
+   d=now-timedelta(days=back)
+   if days and d.weekday() not in days:continue
+   dt=d.replace(hour=h,minute=m,second=0,microsecond=0)
+   if dt<=now and (best is None or dt>best[0]):best=(dt,s)
+   break
+ if not best:return None
+ dt,s=best;return {'profile':s['profile'],'datetime':dt.isoformat(timespec='minutes'),'time':s['time'],'weekdays':s.get('weekdays',[])}
+def next_music_schedule(now=None):
+ now=now or datetime.now();cfg=ensure_music_config();candidates=[]
+ for s in cfg.get('schedule',[]):
+  if not isinstance(s,dict) or not s.get('enabled',True) or not s.get('profile') or not s.get('time'):continue
+  if s.get('profile') not in cfg.get('profiles',{}):continue
+  try:h,m=map(int,str(s['time']).split(':'))
+  except Exception:continue
+  days=s.get('weekdays',[])
+  for off in range(8):
+   d=now+timedelta(days=off)
+   if days and d.weekday() not in days:continue
+   dt=d.replace(hour=h,minute=m,second=0,microsecond=0)
+   if dt>now:candidates.append((dt,s));break
+ if not candidates:return None
+ dt,s=min(candidates,key=lambda x:x[0]);return {'profile':s['profile'],'datetime':dt.isoformat(timespec='minutes'),'time':s['time'],'weekdays':s.get('weekdays',[])}
+
+
+setup_logging(); SETTINGS=load_json(SETTINGS_FILE,{'volume':1.0,'maintenance':False,'allowed_ips':[],'schedules':[],'ducking':{'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000},'sound_profiles':{},'environment_profiles':default_environments(),'active_environment':'Normal','alert_outputs':[{'device':'','volume':1.0,'delay_ms':0}],'music':{'provider':'spotify','profiles':default_music_profiles(),'schedule':[],'active_profile':''}});SETTINGS.setdefault('sound_profiles',{});SETTINGS.setdefault('schedules',[]);SETTINGS.setdefault('ducking',{});SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0,'delay_ms':0}]);ensure_music_config()
 for k,v in {'enabled':True,'duck_volume':.2,'fade_down_ms':1200,'restore_delay_ms':200,'fade_up_ms':2000}.items():SETTINGS['ducking'].setdefault(k,v)
 threading.Thread(target=queue_worker,daemon=True).start()
+
+
 @app.before_request
 def protection():
  allowed=SETTINGS.get('allowed_ips',[])
@@ -218,14 +296,19 @@ def protection():
 def dashboard():return render_template('index.html')
 @app.get('/status')
 def status():
- cfg=SETTINGS['ducking'];sp=spotify_state();q=queue_snapshot()
- return jsonify({'status':'online','server_time':datetime.now().isoformat(timespec='seconds'),'friendly_url':'http://audioserver.local:8765/','version':version(),'uptime_seconds':int(time.time()-START_TIME),'playing':players_busy(),'current_sound':current_sound,'current_priority':current_priority,'queue_length':len(q),'volume':round(float(SETTINGS.get('volume',1.0)),2),'sounds_count':len(scan_sounds()),'maintenance':bool(SETTINGS.get('maintenance')),'active_environment':SETTINGS.get('active_environment'),'alert_outputs':alert_outputs(),'next_schedule':next_schedule(),'spotify':sp,'ducking':{'enabled':cfg['enabled'],'active':duck_active,'spotify_volume_during_alert':cfg['duck_volume'],'fade_down_ms':cfg['fade_down_ms'],'fade_up_ms':cfg['fade_up_ms'],'restore_delay_ms':cfg['restore_delay_ms']}})
+ cfg=SETTINGS['ducking'];sp=spotify_state();q=queue_snapshot();music=ensure_music_config()
+ return jsonify({'status':'online','server_time':datetime.now().isoformat(timespec='seconds'),'friendly_url':'http://audioserver.local:8765/','version':version(),'uptime_seconds':int(time.time()-START_TIME),'playing':players_busy(),'current_sound':current_sound,'current_priority':current_priority,'queue_length':len(q),'volume':round(float(SETTINGS.get('volume',1.0)),2),'sounds_count':len(scan_sounds()),'maintenance':bool(SETTINGS.get('maintenance')),'active_environment':SETTINGS.get('active_environment'),'alert_outputs':alert_outputs(),'next_schedule':next_schedule(),'spotify':sp,'music':{'provider':music.get('provider'),'active_profile':music.get('active_profile'),'next_schedule':next_music_schedule()},'ducking':{'enabled':cfg['enabled'],'active':duck_active,'spotify_volume_during_alert':cfg['duck_volume'],'fade_down_ms':cfg['fade_down_ms'],'fade_up_ms':cfg['fade_up_ms'],'restore_delay_ms':cfg['restore_delay_ms']}})
+
+
 @app.get('/music/status')
 def music_status():
- pid=SETTINGS.get('music',{}).get('provider','spotify'); p=get_provider(pid); data=p.status();data['providers']=provider_catalog();return jsonify(data)
+ cfg=ensure_music_config();pid=cfg.get('provider','spotify');p=get_provider(pid);data=p.status();data['providers']=provider_catalog();data['active_profile']=cfg.get('active_profile','');data['schedule_target']=music_schedule_target();data['next_schedule']=next_music_schedule();return jsonify(data)
+@app.get('/music/profiles')
+def music_profiles_get():
+ cfg=ensure_music_config();return jsonify({'profiles':cfg.get('profiles',{}),'schedule':cfg.get('schedule',[]),'active_profile':cfg.get('active_profile',''),'provider':cfg.get('provider','spotify'),'next_schedule':next_music_schedule()})
 @app.post('/music/command')
 def music_command():
- data=request.get_json(silent=True) or {};cmd=str(data.get('command') or '');p=get_provider(SETTINGS.get('music',{}).get('provider','spotify'))
+ data=request.get_json(silent=True) or {};cmd=str(data.get('command') or '');p=get_provider(ensure_music_config().get('provider','spotify'))
  if cmd=='volume':ok,err=p.set_volume(data.get('value',1.0)) if hasattr(p,'set_volume') else (False,'Volume não suportado')
  else:ok,err=p.command(cmd)
  add_history('music_command','ok' if ok else 'error',f'provider={p.id} command={cmd} error={err or ""}')
@@ -233,11 +316,49 @@ def music_command():
  return jsonify({'status':'ok',**p.status()})
 @app.post('/music/provider')
 def music_provider_select():
- pid=str((request.get_json(silent=True) or {}).get('provider') or '')
- available={x['id']:x for x in provider_catalog()}
+ pid=str((request.get_json(silent=True) or {}).get('provider') or '');available={x['id']:x for x in provider_catalog()}
  if pid not in available:return jsonify({'error':'Provedor desconhecido'}),400
  if not available[pid]['implemented']:return jsonify({'error':'Esse provedor ainda não foi implementado.'}),409
- SETTINGS.setdefault('music',{})['provider']=pid;save_settings();add_history('music_provider','ok',pid);return jsonify({'provider':pid})
+ cfg=ensure_music_config();cfg['provider']=pid;cfg['active_profile']='';save_settings();add_history('music_provider','ok',pid);return jsonify({'provider':pid})
+@app.post('/music/profiles/save')
+def music_profile_save():
+ data=request.get_json(silent=True) or {};name=str(data.get('name') or '').strip()
+ if not name:return jsonify({'error':'Nome do perfil é obrigatório'}),400
+ cfg=ensure_music_config();cfg.setdefault('profiles',{})[name]=clean_music_profile(data);save_settings();add_history('music_profile_save','ok',name);return jsonify({'profile':name,'data':cfg['profiles'][name]})
+@app.post('/music/profiles/delete')
+def music_profile_delete():
+ name=str((request.get_json(silent=True) or {}).get('name') or '').strip();cfg=ensure_music_config()
+ if name not in cfg.get('profiles',{}):return jsonify({'error':'Perfil não encontrado'}),404
+ cfg['profiles'].pop(name,None);cfg['schedule']=[s for s in cfg.get('schedule',[]) if s.get('profile')!=name]
+ if cfg.get('active_profile')==name:cfg['active_profile']=''
+ save_settings();add_history('music_profile_delete','ok',name);return jsonify({'status':'deleted'})
+@app.post('/music/profiles/apply')
+def music_profile_apply_api():
+ name=str((request.get_json(silent=True) or {}).get('name') or '').strip();ok,warning=apply_music_profile(name,'manual')
+ if not ok:return jsonify({'error':warning}),409
+ return jsonify({'status':'ok','active_profile':name,'warning':warning})
+@app.post('/music/schedule')
+def music_schedule_save():
+ data=request.get_json(silent=True) or {};schedule=data.get('schedule')
+ if not isinstance(schedule,list):return jsonify({'error':'schedule deve ser uma lista'}),400
+ cfg=ensure_music_config();clean=[]
+ for s in schedule:
+  if not isinstance(s,dict):continue
+  profile=str(s.get('profile') or '').strip();tm=str(s.get('time') or '').strip()
+  if profile not in cfg.get('profiles',{}) or len(tm)!=5 or tm[2]!=':':continue
+  try:
+   hh,mm=map(int,tm.split(':'))
+   if not (0<=hh<=23 and 0<=mm<=59):continue
+  except Exception:continue
+  weekdays=[]
+  for x in s.get('weekdays',[]):
+   try:x=int(x)
+   except Exception:continue
+   if 0<=x<=6 and x not in weekdays:weekdays.append(x)
+  clean.append({'profile':profile,'time':tm,'weekdays':sorted(weekdays),'enabled':bool(s.get('enabled',True))})
+ cfg['schedule']=clean;save_settings();add_history('music_schedule','ok',f'count={len(clean)}');return jsonify({'schedule':clean,'next_schedule':next_music_schedule()})
+
+
 @app.get('/sounds')
 def sounds():
  data=scan_sounds();return jsonify({'directory':SOUNDS_DIR,'sounds':[{'name':n,**meta,'profile':sound_profile(n)} for n,meta in data.items()]})
@@ -287,7 +408,7 @@ def ducking():
 @app.post('/maintenance')
 def maintenance():SETTINGS['maintenance']=bool((request.get_json(silent=True) or {}).get('enabled'));save_settings();return jsonify({'maintenance':SETTINGS['maintenance']})
 @app.get('/config')
-def config():return jsonify({'allowed_ips':SETTINGS.get('allowed_ips',[]),'schedules':SETTINGS.get('schedules',[]),'sound_profiles':SETTINGS.get('sound_profiles',{}),'ducking':SETTINGS['ducking'],'environment_profiles':SETTINGS.get('environment_profiles',{}),'active_environment':SETTINGS.get('active_environment'),'alert_outputs':alert_outputs(),'music':SETTINGS.get('music',{})})
+def config():return jsonify({'allowed_ips':SETTINGS.get('allowed_ips',[]),'schedules':SETTINGS.get('schedules',[]),'sound_profiles':SETTINGS.get('sound_profiles',{}),'ducking':SETTINGS['ducking'],'environment_profiles':SETTINGS.get('environment_profiles',{}),'active_environment':SETTINGS.get('active_environment'),'alert_outputs':alert_outputs(),'music':ensure_music_config()})
 @app.post('/config/alert-outputs')
 def configure_alert_outputs():
  if players_busy():return jsonify({'error':'Pare o alerta atual antes de alterar as saídas.'}),409
@@ -296,12 +417,12 @@ def configure_alert_outputs():
  clean=[];seen=set()
  for x in outputs:
   if not isinstance(x,dict):continue
-  device=str(x.get('device') or '').strip(); volume=x.get('volume',1.0)
-  try:volume=max(0.0,min(1.0,float(volume)))
-  except Exception:return jsonify({'error':'Volume de saída inválido.'}),400
+  device=str(x.get('device') or '').strip();volume=x.get('volume',1.0)
+  try:volume=max(0.0,min(1.0,float(volume)));delay=max(0,min(5000,int(x.get('delay_ms',0))))
+  except Exception:return jsonify({'error':'Volume ou atraso de saída inválido.'}),400
   key=device.lower()
   if key in seen:continue
-  seen.add(key);clean.append({'device':device,'volume':volume})
+  seen.add(key);clean.append({'device':device,'volume':volume,'delay_ms':delay})
  if not clean:return jsonify({'error':'Selecione pelo menos uma saída válida.'}),400
  SETTINGS['alert_outputs']=clean;save_settings();add_history('alert_outputs','ok',f'count={len(clean)}');return jsonify({'outputs':clean})
 @app.get('/config/export')
@@ -314,7 +435,7 @@ def import_config():
  if not isinstance(data,dict):return jsonify({'error':'JSON de configuracao invalido'}),400
  required={'ducking','schedules','sound_profiles'}
  if not required.issubset(set(data.keys())):return jsonify({'error':'Arquivo nao parece ser uma configuracao do AudioServer'}),400
- backup_settings();SETTINGS=data;SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0}]);SETTINGS.setdefault('music',{'provider':'spotify'});save_settings();add_history('config_import','ok');return jsonify({'status':'imported'})
+ backup_settings();SETTINGS=data;SETTINGS.setdefault('environment_profiles',default_environments());SETTINGS.setdefault('active_environment','Normal');SETTINGS.setdefault('alert_outputs',[{'device':'','volume':1.0,'delay_ms':0}]);ensure_music_config();save_settings();add_history('config_import','ok');return jsonify({'status':'imported'})
 @app.post('/config/schedules')
 def schedules():
  s=(request.get_json(silent=True) or {}).get('schedules')
@@ -348,8 +469,10 @@ def environments_delete():
  name=(request.get_json(silent=True) or {}).get('name')
  if name in ('Normal','Baixo volume','Evento','Manutencao'):return jsonify({'error':'Perfil padrao nao pode ser removido'}),400
  SETTINGS.setdefault('environment_profiles',{}).pop(name,None);save_settings();return jsonify({'environment_profiles':SETTINGS['environment_profiles']})
+
+
 def scheduler():
- fired=set()
+ fired=set();last_music_target='';last_music_attempt=0
  while True:
   now=datetime.now();key=now.strftime('%Y-%m-%d %H:%M')
   for i,s in enumerate(list(SETTINGS.get('schedules',[]))):
@@ -363,7 +486,15 @@ def scheduler():
      ok,err,item=enqueue_sound(s.get('sound'),'schedule',key);add_history('schedule_enqueue','ok' if ok else 'error',f"sound={s.get('sound')} error={err or ''}",key)
     fired.add(marker)
    except Exception as exc:app.logger.error('scheduler error=%s',exc)
-  fired={x for x in fired if x.startswith(now.strftime('%Y-%m-%d'))};time.sleep(10)
+  fired={x for x in fired if x.startswith(now.strftime('%Y-%m-%d'))}
+  try:
+   target=music_schedule_target(now);target_name=target.get('profile') if target else ''
+   active=ensure_music_config().get('active_profile','')
+   if target_name and target_name!=active and (target_name!=last_music_target or time.time()-last_music_attempt>=300):
+    last_music_target=target_name;last_music_attempt=time.time();ok,err=apply_music_profile(target_name,'schedule')
+    if not ok:add_history('music_profile_schedule','error',f'name={target_name} error={err or ""}',target.get('datetime'))
+  except Exception as exc:app.logger.error('music scheduler error=%s',exc)
+  time.sleep(10)
 threading.Thread(target=scheduler,daemon=True).start()
 if __name__=='__main__':
  start_mdns(8765)
