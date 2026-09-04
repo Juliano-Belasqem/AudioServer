@@ -1,4 +1,4 @@
-import json, os, shutil, socket, threading, time, urllib.request
+import json, os, shutil, socket, subprocess, threading, time, urllib.request
 from collections import deque
 from datetime import datetime
 
@@ -145,6 +145,17 @@ def configure_alerts():
 @bp.post('/diagnostics/test-alert')
 def test_alert():emit_alert('test','Alerta de teste do AudioServer','info');return jsonify({'status':'sent'})
 
+@bp.post('/system/shutdown')
+def system_shutdown():
+ data=request.get_json(silent=True) or {}
+ if str(data.get('confirmation') or '').strip().upper()!='DESLIGAR':return jsonify({'error':'Confirmação inválida. Digite DESLIGAR para confirmar.'}),400
+ if os.name!='nt':return jsonify({'error':'O desligamento remoto está disponível apenas no servidor Windows.'}),409
+ try:
+  emit_alert('system_shutdown',f'Desligamento solicitado por {request.remote_addr}','info')
+  subprocess.Popen(['shutdown.exe','/s','/t','15','/c','AudioServer: desligamento solicitado pela interface web.'],creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+  return jsonify({'status':'scheduled','seconds':15,'message':'O computador será desligado em 15 segundos.'})
+ except Exception as exc:return jsonify({'error':f'Não foi possível solicitar o desligamento: {exc}'}),500
+
 @bp.after_app_request
 def inject_dashboard_links(response):
  try:
@@ -152,7 +163,12 @@ def inject_dashboard_links(response):
    text=response.get_data(as_text=True);marker='<a class="linkbtn" href="/static/audio-output.html">🔊 Saída de áudio</a>';extra=''
    if '/static/music.html' not in text:extra+='<a class="linkbtn" href="/static/music.html">🎵 Música ambiente</a>'
    if '/static/offers.html' not in text:extra+='<a class="linkbtn" href="/static/offers.html">📣 Ofertas</a>'
-   if marker in text and extra:response.set_data(text.replace(marker,marker+extra,1));response.headers['Content-Length']=len(response.get_data())
+   if 'shutdownServer()' not in text:
+    extra+='<button class="danger" onclick="shutdownServer()" title="Desligar o computador servidor">⏻ Desligar servidor</button>'
+    script='''<script>async function shutdownServer(){const first=confirm('Desligar o computador do AudioServer? A rádio e os alertas ficarão indisponíveis até a máquina ser ligada novamente.');if(!first)return;const word=prompt('Para confirmar, digite DESLIGAR:');if(word!==\"DESLIGAR\")return alert('Desligamento cancelado.');try{const r=await fetch('/system/shutdown',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation:word})});const t=await r.text();let j;try{j=JSON.parse(t)}catch{throw new Error('Resposta inválida do servidor.')}if(!r.ok)throw new Error(j.error||'Não foi possível desligar.');alert(j.message||'Desligamento agendado.');}catch(e){alert(e.message);}}</script>'''
+    text=text.replace('</body>',script+'</body>',1)
+   if marker in text and extra:text=text.replace(marker,marker+extra,1)
+   response.set_data(text);response.headers['Content-Length']=len(response.get_data())
  except Exception:pass
  return response
 
